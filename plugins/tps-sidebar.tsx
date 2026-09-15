@@ -1,8 +1,10 @@
 /** @jsxImportSource @opentui/solid */
 import type { AssistantMessage } from "@opencode-ai/sdk/v2"
 import type { TuiPlugin, TuiPluginApi, TuiPluginModule } from "@opencode-ai/plugin/tui"
-import { createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { createMemo, createSignal, createEffect, onCleanup, Show } from "solid-js"
 
+// only used to estimate the in-flight (not yet completed) message, where the
+// server token count is not finalized yet. completed messages use real tokens.
 const CHARS_PER_TOKEN = 3.5
 
 function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
@@ -11,6 +13,10 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
   const timer = setInterval(() => setNow(Date.now()), 500)
   onCleanup(() => clearInterval(timer))
 
+  // Decode throughput = generated content tokens / content streaming time.
+  //
+  // This memo reads `now()` so it re-evaluates on every timer tick. That keeps
+  // the read fresh even if the TUI state API is not itself reactive.
   const tps = createMemo(() => {
     const msgs = props.api.state.session.messages(props.getSessionID())
     if (!msgs) return undefined
@@ -21,25 +27,50 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
 
     let tokens = 0
     let genMs = 0
-    let streamChars = 0
+    let idleMs = 0
     let inflight = false
+    let streamChars = 0
     for (const m of turn) {
+      const completed = !!m.time.completed
       tokens += (m.tokens?.output ?? 0) + (m.tokens?.reasoning ?? 0)
-      if (m.time.completed) {
-        genMs += Math.max(0, m.time.completed - m.time.created)
+      const parts = props.api.state.part(m.id) ?? []
+      let genStart: number | undefined
+      let genEnd: number | undefined
+      for (const part of parts) {
+        if (part.type !== "text" && part.type !== "reasoning") continue
+        if (!completed) streamChars += part.text.length
+        const t0: number | undefined = (part as any).time?.start
+        const t1: number | undefined = (part as any).time?.end
+        if (t0 && (genStart === undefined || t0 < genStart)) genStart = t0
+        const end = t1 ?? (completed ? undefined : now())
+        if (end !== undefined && (genEnd === undefined || end > genEnd)) genEnd = end
+      }
+      if (!completed) inflight = true
+      if (genStart === undefined) {
+        // no text parts yet: fall back to the raw message window
+        genMs += Math.max(0, (m.time.completed ?? now()) - m.time.created)
       } else {
-        inflight = true
-        for (const part of props.api.state.part(m.id) ?? []) {
-          if (part.type === "text" || part.type === "reasoning") streamChars += part.text.length
-        }
-        genMs += Math.max(0, now() - m.time.created)
+        const from = Math.max(m.time.created, genStart)
+        const to = Math.min(m.time.completed ?? now(), genEnd ?? now())
+        genMs += Math.max(0, to - from)
+        idleMs += Math.max(0, from - m.time.created)
+        if (m.time.completed) idleMs += Math.max(0, m.time.completed - (genEnd ?? m.time.created))
       }
     }
+    // in-flight message: server token count is not final yet, estimate by chars
+    if (inflight) tokens += Math.round(streamChars / CHARS_PER_TOKEN)
 
-    const est = tokens + Math.round(streamChars / CHARS_PER_TOKEN)
     const secs = genMs / 1000
-    if (secs < 1 || est < 20) return undefined
-    return { value: est / secs, est, secs, inflight }
+    if (secs < 1 || tokens < 20) return undefined
+    return { value: tokens / secs, est: tokens, secs, inflight, idle: idleMs / 1000 }
+  })
+
+  // Keep the last valid value so the number stays visible after a turn
+  // completes, even if the memo briefly returns undefined.
+  const [last, setLast] = createSignal<{ value: number; est: number; secs: number; inflight: boolean; idle: number }>()
+  createEffect(() => {
+    const t = tps()
+    if (t) setLast(t)
   })
 
   const color = (value: number) => {
@@ -49,7 +80,7 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
   }
 
   return (
-    <Show when={tps()}>
+    <Show when={tps() ?? last()}>
       {(t) => (
         <text fg={theme().textMuted}>
           <span style={{ fg: color(t().value) }}>
@@ -60,7 +91,10 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
           </span>
           <span style={{ fg: theme().textMuted }}>
             {" "}
-            tok/s {t().inflight ? "· generating" : `· ${t().est} tok / ${t().secs.toFixed(1)}s`}
+            tok/s{" "}
+            {t().inflight
+              ? "· generating"
+              : `· ${t().est} tok / ${t().secs.toFixed(1)}s${t().idle >= 0.5 ? ` (idle ${t().idle.toFixed(1)}s excluded)` : ""}`}
           </span>
         </text>
       )}
