@@ -30,22 +30,33 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
     let idleMs = 0
     let inflight = false
     let streamChars = 0
+    let thinking = 0
+    let thinkingLive = 0
     for (const m of turn) {
       const completed = !!m.time.completed
       tokens += (m.tokens?.output ?? 0) + (m.tokens?.reasoning ?? 0)
       const parts = props.api.state.part(m.id) ?? []
       let genStart: number | undefined
       let genEnd: number | undefined
+      let curLive = 0
       for (const part of parts) {
         if (part.type !== "text" && part.type !== "reasoning") continue
         if (!completed) streamChars += part.text.length
+        if (part.type === "reasoning") {
+          const rt = Math.round(part.text.length / CHARS_PER_TOKEN)
+          if (completed) thinking += m.tokens?.reasoning || rt
+          else curLive += rt
+        }
         const t0: number | undefined = (part as any).time?.start
         const t1: number | undefined = (part as any).time?.end
         if (t0 && (genStart === undefined || t0 < genStart)) genStart = t0
         const end = t1 ?? (completed ? undefined : now())
         if (end !== undefined && (genEnd === undefined || end > genEnd)) genEnd = end
       }
-      if (!completed) inflight = true
+      if (!completed) {
+        inflight = true
+        thinkingLive += curLive
+      }
       if (genStart === undefined) {
         // no text parts yet: fall back to the raw message window
         genMs += Math.max(0, (m.time.completed ?? now()) - m.time.created)
@@ -61,13 +72,14 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
     if (inflight) tokens += Math.round(streamChars / CHARS_PER_TOKEN)
 
     const secs = genMs / 1000
-    if (secs < 1 || tokens < 20) return undefined
-    return { value: tokens / secs, est: tokens, secs, inflight, idle: idleMs / 1000 }
+    const thinkingTotal = thinking + thinkingLive
+    if ((secs < 1 || tokens < 20) && thinkingTotal === 0) return undefined
+    return { value: secs >= 1 && tokens >= 20 ? tokens / secs : 0, est: tokens, secs, inflight, idle: idleMs / 1000, thinking: thinkingTotal }
   })
 
   // Keep the last valid value so the number stays visible after a turn
   // completes, even if the memo briefly returns undefined.
-  const [last, setLast] = createSignal<{ value: number; est: number; secs: number; inflight: boolean; idle: number }>()
+  const [last, setLast] = createSignal<{ value: number; est: number; secs: number; inflight: boolean; idle: number; thinking: number }>()
   createEffect(() => {
     const t = tps()
     if (t) setLast(t)
@@ -83,19 +95,30 @@ function TpsView(props: { api: TuiPluginApi; getSessionID: () => string }) {
     <Show when={tps() ?? last()}>
       {(t) => (
         <text fg={theme().textMuted}>
-          <span style={{ fg: color(t().value) }}>
-            <b>
-              {t().inflight ? "~" : ""}
-              {t().value.toFixed(1)}
-            </b>
-          </span>
-          <span style={{ fg: theme().textMuted }}>
-            {" "}
-            tok/s{" "}
-            {t().inflight
-              ? "· generating"
-              : `· ${t().est} tok / ${t().secs.toFixed(1)}s${t().idle >= 0.5 ? ` (idle ${t().idle.toFixed(1)}s excluded)` : ""}`}
-          </span>
+          <Show when={t().value > 0}>
+            <span style={{ fg: color(t().value) }}>
+              <b>
+                {t().inflight ? "~" : ""}
+                {t().value.toFixed(1)}
+              </b>
+            </span>
+            <span style={{ fg: theme().textMuted }}>
+              {" "}
+              tok/s{" "}
+              {t().inflight
+                ? "· generating"
+                : `· ${t().est} tok / ${t().secs.toFixed(1)}s${t().idle >= 0.5 ? ` (idle ${t().idle.toFixed(1)}s excluded)` : ""}`}
+            </span>
+          </Show>
+          <Show when={t().thinking > 0}>
+            <span style={{ fg: theme().textMuted }}>
+              {"  "}
+              <span style={{ fg: theme().warning }}>
+                <b>{t().thinking}</b>
+              </span>{" "}
+              think
+            </span>
+          </Show>
         </text>
       )}
     </Show>
